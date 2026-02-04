@@ -122,7 +122,21 @@ def main():
                 print("   - https://huggingface.co/pyannote/segmentation-3.0")
                 sys.exit(1)
             
-            diarizer = SpeakerDiarizer(hf_token=hf_token, device=args.device)
+            # Используем CPU для diarization если GPU не поддерживает архитектуру
+            # (например, RTX 5060 Ti с sm_120 не поддерживается PyTorch 2.5.1)
+            diarizer_device = args.device
+            if args.device == 'cuda':
+                import torch
+                # Проверяем поддержку GPU для pyannote.audio
+                if torch.cuda.is_available():
+                    device_capability = torch.cuda.get_device_capability(0)
+                    # sm_120 и новее не поддерживаются PyTorch 2.5.1
+                    if device_capability[0] >= 12:
+                        print(f"⚠️  GPU архитектура sm_{device_capability[0]}{device_capability[1]} не поддерживается PyTorch")
+                        print(f"   Используем CPU для определения спикеров (транскрибация на GPU работает)")
+                        diarizer_device = 'cpu'
+            
+            diarizer = SpeakerDiarizer(hf_token=hf_token, device=diarizer_device)
             diarization_segments = diarizer.diarize(
                 processed_audio,
                 num_speakers=args.num_speakers,
