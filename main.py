@@ -15,12 +15,11 @@ from dotenv import load_dotenv
 
 # Импорт модулей транскрибатора
 from src.audio_processor import AudioProcessor
-from src.transcriber import WhisperTranscriber
-from src.diarizer import SpeakerDiarizer
-from src.merger import TranscriptionMerger
+from src.whisperx_pipeline import run_whisperx_pipeline
 from src.exporters.text_exporter import export_to_text
 from src.exporters.json_exporter import export_to_json
 from src.exporters.srt_exporter import export_to_srt, export_to_vtt
+from src.command_store import save_command, list_commands
 
 
 def main():
@@ -29,9 +28,51 @@ def main():
     # Загружаем переменные окружения
     load_dotenv()
     
+    # Проверка доступности CUDA перед запуском
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            print("❌ Ошибка: CUDA недоступна!")
+            print("Проект настроен только на работу с CUDA GPU.")
+            print("\nУбедитесь, что:")
+            print("1. Установлен PyTorch с поддержкой CUDA")
+            print("2. Установлены драйверы NVIDIA")
+            print("3. GPU поддерживает CUDA")
+            print("\nСм. инструкции в INSTALL.md")
+            sys.exit(1)
+    except ImportError:
+        print("❌ Ошибка: PyTorch не установлен!")
+        print("Установите PyTorch с поддержкой CUDA.")
+        print("См. инструкции в INSTALL.md")
+        sys.exit(1)
+    
     # Парсинг аргументов
     parser = create_argument_parser()
     args = parser.parse_args()
+
+    if args.list_commands:
+        commands = list_commands()
+        if not commands:
+            print("Сохраненных команд нет.")
+        else:
+            print("Сохраненные команды:")
+            for item in commands:
+                desc = f" - {item['description']}" if item.get("description") else ""
+                print(f"  • {item['name']}{desc}")
+                print(f"    {item['command']}")
+        sys.exit(0)
+
+    if not args.input_file:
+        print("Ошибка: не указан входной файл")
+        parser.print_help()
+        sys.exit(1)
+
+    # Принудительно используем CUDA и float16
+    if args.device != 'cuda':
+        print("Ошибка: проект настроен только на работу с CUDA GPU")
+        sys.exit(1)
+    if args.compute_type == 'int8':
+        args.compute_type = 'float16'
     
     # Проверка входного файла
     if not os.path.exists(args.input_file):
@@ -46,7 +87,7 @@ def main():
     input_filename = Path(args.input_file).stem
     
     print("=" * 80)
-    print("TRANSCRIBATOR - Транскрибация с определением спикеров")
+    print("TRANSCRIBATOR - WhisperX транскрибация с определением спикеров")
     print("=" * 80)
     print(f"Входной файл: {args.input_file}")
     print(f"Выходная директория: {args.output_dir}")
@@ -61,7 +102,7 @@ def main():
     try:
         # Шаг 1: Предобработка аудио
         print("\n" + "="*80)
-        print("[1/5] ПРЕДОБРАБОТКА АУДИО")
+        print("[1/3] ПРЕДОБРАБОТКА АУДИО")
         print("="*80)
         processor = AudioProcessor()
         processed_audio = processor.preprocess_audio(args.input_file)
@@ -70,126 +111,45 @@ def main():
         print(f"  └─ Длительность: {audio_duration:.2f} сек ({audio_duration/60:.1f} мин)")
         print(f"  └─ Формат: WAV 16kHz моно")
         
-        # Шаг 2: Транскрибация
+        # Шаг 2: WhisperX (транскрибация + alignment + diarization)
         print("\n" + "="*80)
-        print(f"[2/5] ТРАНСКРИБАЦИЯ (модель: {args.model})")
+        print(f"[2/3] WHISPERX (модель: {args.model})")
         print("="*80)
-        
-        # Определяем оптимальное количество потоков
-        cpu_count = os.cpu_count() or 4
-        cpu_threads = args.cpu_threads if args.cpu_threads > 0 else cpu_count
-        num_workers = args.num_workers if args.num_workers > 0 else min(4, cpu_count)
-        
-        print(f"⚙️  Оптимизация CPU:")
-        print(f"  └─ Доступно ядер: {cpu_count}")
-        print(f"  └─ Используется потоков: {cpu_threads}")
-        print(f"  └─ Параллельных воркеров: {num_workers}")
-        print()
-        
-        transcriber = WhisperTranscriber(
+
+        hf_token = args.hf_token or os.getenv('HF_TOKEN')
+
+        merged_segments, wx_metadata = run_whisperx_pipeline(
+            audio_file=processed_audio,
             model_size=args.model,
             device=args.device,
             compute_type=args.compute_type,
-            cpu_threads=cpu_threads,
-            num_workers=num_workers
-        )
-        transcription_segments = transcriber.transcribe(
-            processed_audio,
+            batch_size=args.batch_size,
             language=args.language,
-            vad_filter=args.vad_filter
+            align=args.align,
+            diarize=not args.no_diarization,
+            hf_token=hf_token,
+            num_speakers=args.num_speakers,
+            min_speakers=args.min_speakers,
+            max_speakers=args.max_speakers
         )
-        print(f"\n✓ Транскрибация завершена!")
-        print(f"  └─ Получено сегментов: {len(transcription_segments)}")
-        print(f"  └─ Общее время текста: {sum(s.end - s.start for s in transcription_segments):.1f} сек")
+
+        print(f"\n✓ WhisperX завершен!")
+        print(f"  └─ Получено сегментов: {len(merged_segments)}")
         
-        # Шаг 3: Определение спикеров (если включено)
-        diarization_segments = None
-        if not args.no_diarization:
-            print("\n" + "="*80)
-            print("[3/5] ОПРЕДЕЛЕНИЕ СПИКЕРОВ")
-            print("="*80)
-            
-            # Получаем HuggingFace токен
-            hf_token = args.hf_token or os.getenv('HF_TOKEN')
-            if not hf_token or hf_token == 'your_huggingface_token_here':
-                print("Ошибка: не указан HuggingFace токен!")
-                print("Укажите токен через --hf-token или в .env файле (HF_TOKEN)")
-                print("Как получить токен:")
-                print("1. Зарегистрируйтесь на https://huggingface.co")
-                print("2. Создайте токен: https://huggingface.co/settings/tokens")
-                print("3. Примите лицензии моделей:")
-                print("   - https://huggingface.co/pyannote/speaker-diarization-3.1")
-                print("   - https://huggingface.co/pyannote/segmentation-3.0")
-                sys.exit(1)
-            
-            # Используем CPU для diarization если GPU не поддерживает архитектуру
-            # (например, RTX 5060 Ti с sm_120 не поддерживается PyTorch 2.5.1)
-            diarizer_device = args.device
-            if args.device == 'cuda':
-                import torch
-                # Проверяем поддержку GPU для pyannote.audio
-                if torch.cuda.is_available():
-                    device_capability = torch.cuda.get_device_capability(0)
-                    # sm_120 и новее не поддерживаются PyTorch 2.5.1
-                    if device_capability[0] >= 12:
-                        print(f"⚠️  GPU архитектура sm_{device_capability[0]}{device_capability[1]} не поддерживается PyTorch")
-                        print(f"   Используем CPU для определения спикеров (транскрибация на GPU работает)")
-                        diarizer_device = 'cpu'
-            
-            diarizer = SpeakerDiarizer(hf_token=hf_token, device=diarizer_device)
-            diarization_segments = diarizer.diarize(
-                processed_audio,
-                num_speakers=args.num_speakers,
-                min_speakers=args.min_speakers,
-                max_speakers=args.max_speakers
-            )
-        else:
-            print("\n" + "="*80)
-            print("[3/5] ОПРЕДЕЛЕНИЕ СПИКЕРОВ - ПРОПУЩЕНО")
-            print("="*80)
-            print("⚠️  Использован параметр --no-diarization")
-        
-        # Шаг 4: Объединение результатов
+        # Шаг 3: Экспорт результатов
         print("\n" + "="*80)
-        print("[4/5] ОБЪЕДИНЕНИЕ РЕЗУЛЬТАТОВ")
-        print("="*80)
-        if diarization_segments:
-            print("🔗 Объединяем транскрипцию со спикерами...")
-            merger = TranscriptionMerger(min_overlap_ratio=args.min_overlap)
-            merged_segments = merger.merge(transcription_segments, diarization_segments)
-            stats = merger.get_statistics(merged_segments)
-            print(f"\n✓ Объединение завершено!")
-            print(f"  └─ Всего сегментов: {len(merged_segments)}")
-            print(f"  └─ Спикеров: {stats['num_speakers']}")
-            if stats['unknown_segments'] > 0:
-                print(f"  └─ ⚠️  Неопределенных сегментов: {stats['unknown_segments']}")
-        else:
-            # Без diarization - просто используем транскрипцию
-            from src.merger import MergedSegment
-            merged_segments = [
-                MergedSegment(
-                    start=seg.start,
-                    end=seg.end,
-                    text=seg.text,
-                    speaker='SPEAKER_00',
-                    confidence=1.0
-                )
-                for seg in transcription_segments
-            ]
-            print(f"✓ Сегментов транскрипции: {len(merged_segments)}")
-        
-        # Шаг 5: Экспорт результатов
-        print("\n" + "="*80)
-        print("[5/5] ЭКСПОРТ РЕЗУЛЬТАТОВ")
+        print("[3/3] ЭКСПОРТ РЕЗУЛЬТАТОВ")
         print("="*80)
         
         # Метаданные для экспорта
         metadata = {
             'source_file': os.path.basename(args.input_file),
-            'model': args.model,
-            'language': args.language,
+            'model': wx_metadata.get('model', args.model),
+            'language': wx_metadata.get('language', args.language),
             'duration': audio_duration,
-            'diarization_enabled': not args.no_diarization
+            'diarization_enabled': not args.no_diarization,
+            'aligned': wx_metadata.get('aligned', args.align),
+            'batch_size': wx_metadata.get('batch_size', args.batch_size)
         }
         
         exported_files = []
@@ -237,8 +197,8 @@ def main():
         if processed_audio != args.input_file:
             try:
                 os.remove(processed_audio)
-            except:
-                pass
+            except OSError as e:
+                print(f"⚠️  Не удалось удалить временный файл: {processed_audio} ({e})")
         
         # Итоги
         elapsed_time = time.time() - start_time
@@ -252,6 +212,11 @@ def main():
         for file_path in exported_files:
             print(f"  - {file_path}")
         print("=" * 80)
+
+        if args.save_command:
+            command_str = " ".join(sys.argv)
+            save_command(args.save_command, command_str)
+            print(f"\n✓ Команда сохранена как: {args.save_command}")
         
     except KeyboardInterrupt:
         print("\n\nОперация прервана пользователем")
@@ -291,10 +256,11 @@ def create_argument_parser() -> argparse.ArgumentParser:
         """
     )
     
-    # Обязательные аргументы
+    # Входной файл
     parser.add_argument(
         'input_file',
         type=str,
+        nargs='?',
         help='Путь к входному аудио или видео файлу'
     )
     
@@ -332,9 +298,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--device',
         type=str,
-        choices=['cpu', 'cuda'],
-        default='cpu',
-        help='Устройство для вычислений (по умолчанию: cpu)'
+        choices=['cuda'],
+        default='cuda',
+        help='Устройство для вычислений (только CUDA GPU)'
     )
     
     parser.add_argument(
@@ -342,21 +308,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         type=str,
         choices=['int8', 'float16', 'float32'],
         default='int8',
-        help='Тип вычислений (int8 для CPU, float16 для GPU)'
-    )
-    
-    parser.add_argument(
-        '--cpu-threads',
-        type=int,
-        default=0,
-        help='Количество потоков CPU (0 = все доступные)'
-    )
-    
-    parser.add_argument(
-        '--num-workers',
-        type=int,
-        default=0,
-        help='Количество параллельных воркеров (0 = автоопределение)'
+        help='Тип вычислений (float16 для CUDA GPU, float32 для максимальной точности)'
     )
     
     # Параметры diarization
@@ -396,23 +348,43 @@ def create_argument_parser() -> argparse.ArgumentParser:
     
     # Дополнительные параметры
     parser.add_argument(
-        '--min-overlap',
-        type=float,
-        default=0.5,
-        help='Минимальное пересечение для назначения спикера (0.0-1.0)'
+        '--batch-size',
+        type=int,
+        default=16,
+        help='Batch size для WhisperX (выше = быстрее, больше VRAM)'
     )
-    
+
     parser.add_argument(
-        '--vad-filter',
+        '--align',
+        dest='align',
         action='store_true',
-        default=True,
-        help='Использовать Voice Activity Detection'
+        help='Включить выравнивание (word-level timestamps)'
     )
+    parser.add_argument(
+        '--no-align',
+        dest='align',
+        action='store_false',
+        help='Выключить выравнивание (alignment)'
+    )
+    parser.set_defaults(align=True)
     
     parser.add_argument(
         '--show-confidence',
         action='store_true',
         help='Показывать уверенность в текстовом экспорте'
+    )
+
+    parser.add_argument(
+        '--save-command',
+        type=str,
+        default=None,
+        help='Сохранить команду запуска под указанным именем'
+    )
+
+    parser.add_argument(
+        '--list-commands',
+        action='store_true',
+        help='Показать сохраненные команды и выйти'
     )
     
     parser.add_argument(

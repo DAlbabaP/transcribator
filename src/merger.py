@@ -36,18 +36,24 @@ class MergedSegment:
 class TranscriptionMerger:
     """Класс для объединения транскрипции и diarization"""
     
-    def __init__(self, min_overlap_ratio: float = 0.5):
+    def __init__(self, min_overlap_ratio: float = 0.5, unknown_policy: str = "keep"):
         """
         Инициализация merger
         
         Args:
             min_overlap_ratio: Минимальное отношение пересечения для назначения спикера (0.0 - 1.0)
                               Если пересечение меньше этого значения, спикер будет UNKNOWN
+            unknown_policy: Политика для сегментов ниже порога пересечения:
+                            - "keep": оставлять UNKNOWN
+                            - "best_overlap": назначать спикера с максимальным пересечением
         """
         if not 0.0 <= min_overlap_ratio <= 1.0:
             raise ValueError("min_overlap_ratio должен быть между 0.0 и 1.0")
+        if unknown_policy not in {"keep", "best_overlap"}:
+            raise ValueError("unknown_policy должен быть 'keep' или 'best_overlap'")
         
         self.min_overlap_ratio = min_overlap_ratio
+        self.unknown_policy = unknown_policy
     
     def merge(
         self,
@@ -147,6 +153,8 @@ class TranscriptionMerger:
         # Определяем уверенность
         if max_overlap < self.min_overlap_ratio:
             # Пересечение слишком мало
+            if self.unknown_policy == "best_overlap" and max_overlap > 0.0:
+                return best_speaker, max_overlap
             return 'UNKNOWN', max_overlap
         
         return best_speaker, max_overlap
@@ -285,7 +293,8 @@ class TranscriptionMerger:
 def merge_transcription_and_speakers(
     transcription: List[TranscriptionSegment],
     diarization: List[SpeakerSegment],
-    min_overlap_ratio: float = 0.5
+    min_overlap_ratio: float = 0.5,
+    unknown_policy: str = "keep"
 ) -> List[MergedSegment]:
     """
     Вспомогательная функция для объединения транскрипции и diarization
@@ -294,9 +303,13 @@ def merge_transcription_and_speakers(
         transcription: Список сегментов транскрипции
         diarization: Список сегментов с спикерами
         min_overlap_ratio: Минимальное отношение пересечения
+        unknown_policy: Политика для сегментов ниже порога пересечения
         
     Returns:
         Список объединенных сегментов
     """
-    merger = TranscriptionMerger(min_overlap_ratio=min_overlap_ratio)
+    merger = TranscriptionMerger(
+        min_overlap_ratio=min_overlap_ratio,
+        unknown_policy=unknown_policy
+    )
     return merger.merge(transcription, diarization)

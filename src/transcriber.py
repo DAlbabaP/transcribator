@@ -39,8 +39,8 @@ class WhisperTranscriber:
     def __init__(
         self,
         model_size: str = 'small',
-        device: Literal['cpu', 'cuda'] = 'cpu',
-        compute_type: str = 'int8',
+        device: Literal['cuda'] = 'cuda',
+        compute_type: str = 'float16',
         download_root: Optional[str] = None,
         cpu_threads: int = 0,
         num_workers: int = 1
@@ -50,10 +50,9 @@ class WhisperTranscriber:
         
         Args:
             model_size: Размер модели ('tiny', 'base', 'small', 'medium', 'large-v2', 'large-v3')
-            device: Устройство для вычислений ('cpu' или 'cuda')
-            compute_type: Тип вычислений ('int8', 'float16', 'float32')
-                         - 'int8' оптимален для CPU
-                         - 'float16' для GPU
+            device: Устройство для вычислений (только 'cuda')
+            compute_type: Тип вычислений ('float16', 'float32')
+                         - 'float16' оптимален для GPU
             download_root: Директория для кэширования моделей
             cpu_threads: Количество потоков CPU (0 = автоопределение)
             num_workers: Количество параллельных воркеров
@@ -103,7 +102,13 @@ class WhisperTranscriber:
         best_of: int = 5,
         temperature: float = 0.0,
         vad_filter: bool = True,
-        word_timestamps: bool = False
+        word_timestamps: bool = False,
+        condition_on_previous_text: bool = True,
+        compression_ratio_threshold: Optional[float] = None,
+        log_prob_threshold: Optional[float] = None,
+        no_speech_threshold: Optional[float] = None,
+        hallucination_silence_threshold: Optional[float] = None,
+        vad_parameters: Optional[Dict] = None
     ) -> List[TranscriptionSegment]:
         """
         Транскрибация аудио файла
@@ -116,6 +121,12 @@ class WhisperTranscriber:
             temperature: Температура семплирования (0.0 = детерминированно)
             vad_filter: Использовать Voice Activity Detection для фильтрации тишины
             word_timestamps: Возвращать временные метки для отдельных слов
+            condition_on_previous_text: Учитывать предыдущий текст при декодировании
+            compression_ratio_threshold: Порог для детекта повторов (None = дефолт модели)
+            log_prob_threshold: Порог низкой уверенности (None = дефолт модели)
+            no_speech_threshold: Порог тишины (None = дефолт модели)
+            hallucination_silence_threshold: Порог тишины для подавления галлюцинаций
+            vad_parameters: Параметры VAD фильтра (dict)
             
         Returns:
             Список сегментов транскрибации
@@ -127,19 +138,36 @@ class WhisperTranscriber:
         print(f"Язык: {language}, VAD фильтр: {vad_filter}")
         
         # Запуск транскрибации
+        transcribe_kwargs = {
+            "language": language,
+            "beam_size": beam_size,
+            "best_of": best_of,
+            "temperature": temperature,
+            "vad_filter": vad_filter,
+            "word_timestamps": word_timestamps,
+            "condition_on_previous_text": condition_on_previous_text
+        }
+        if compression_ratio_threshold is not None:
+            transcribe_kwargs["compression_ratio_threshold"] = compression_ratio_threshold
+        if log_prob_threshold is not None:
+            transcribe_kwargs["log_prob_threshold"] = log_prob_threshold
+        if no_speech_threshold is not None:
+            transcribe_kwargs["no_speech_threshold"] = no_speech_threshold
+        if hallucination_silence_threshold is not None:
+            transcribe_kwargs["hallucination_silence_threshold"] = hallucination_silence_threshold
+        if vad_parameters is not None:
+            transcribe_kwargs["vad_parameters"] = vad_parameters
+
         segments_iterator, info = self.model.transcribe(
             audio_file,
-            language=language,
-            beam_size=beam_size,
-            best_of=best_of,
-            temperature=temperature,
-            vad_filter=vad_filter,
-            word_timestamps=word_timestamps
+            **transcribe_kwargs
         )
         
         # Информация о распознавании
         print(f"Обнаруженный язык: {info.language} (вероятность: {info.language_probability:.2f})")
         print(f"Длительность аудио: {info.duration:.2f} секунд ({info.duration/60:.1f} минут)")
+        if hasattr(info, "duration_after_vad") and info.duration_after_vad is not None:
+            print(f"Длительность после VAD: {info.duration_after_vad:.2f} секунд ({info.duration_after_vad/60:.1f} минут)")
         
         # Собираем сегменты с прогресс-баром
         segments = []
@@ -228,7 +256,7 @@ def transcribe_audio(
     audio_file: str,
     model_size: str = 'small',
     language: str = 'ru',
-    device: str = 'cpu'
+    device: str = 'cuda'
 ) -> List[TranscriptionSegment]:
     """
     Вспомогательная функция для быстрой транскрибации
@@ -237,7 +265,7 @@ def transcribe_audio(
         audio_file: Путь к аудио файлу
         model_size: Размер модели Whisper
         language: Код языка
-        device: Устройство ('cpu' или 'cuda')
+        device: Устройство (только 'cuda')
         
     Returns:
         Список сегментов транскрибации

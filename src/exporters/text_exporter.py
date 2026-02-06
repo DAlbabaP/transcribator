@@ -11,7 +11,7 @@
 
 from typing import List
 from pathlib import Path
-from ..merger import MergedSegment
+from ..whisperx_pipeline import MergedSegment
 
 
 def format_timestamp(seconds: float) -> str:
@@ -57,6 +57,7 @@ def export_to_text(
             # Группируем последовательные сегменты одного спикера
             current_speaker = None
             current_texts = []
+            current_confidences = []
             current_start = None
             current_end = None
             
@@ -64,31 +65,41 @@ def export_to_text(
                 if seg.speaker != current_speaker:
                     # Записываем предыдущую группу
                     if current_texts:
+                        avg_confidence = (
+                            sum(current_confidences) / len(current_confidences)
+                            if current_confidences
+                            else 0.0
+                        )
                         _write_speaker_block(
                             f, current_speaker, current_start, current_end,
                             ' '.join(current_texts), show_confidence,
-                            sum([s.confidence for s in segments if s.speaker == current_speaker]) / 
-                            len([s for s in segments if s.speaker == current_speaker])
+                            avg_confidence
                         )
                         f.write('\n')
                     
                     # Начинаем новую группу
                     current_speaker = seg.speaker
                     current_texts = [seg.text]
+                    current_confidences = [seg.confidence]
                     current_start = seg.start
                     current_end = seg.end
                 else:
                     # Тот же спикер
                     current_texts.append(seg.text)
+                    current_confidences.append(seg.confidence)
                     current_end = seg.end
             
             # Записываем последнюю группу
             if current_texts:
+                avg_confidence = (
+                    sum(current_confidences) / len(current_confidences)
+                    if current_confidences
+                    else 0.0
+                )
                 _write_speaker_block(
                     f, current_speaker, current_start, current_end,
                     ' '.join(current_texts), show_confidence,
-                    sum([s.confidence for s in segments if s.speaker == current_speaker]) / 
-                    len([s for s in segments if s.speaker == current_speaker])
+                    avg_confidence
                 )
         else:
             # Каждый сегмент отдельно

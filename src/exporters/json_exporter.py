@@ -26,7 +26,7 @@ import json
 from typing import List, Dict, Optional
 from pathlib import Path
 from datetime import datetime
-from ..merger import MergedSegment
+from ..whisperx_pipeline import MergedSegment
 
 
 def export_to_json(

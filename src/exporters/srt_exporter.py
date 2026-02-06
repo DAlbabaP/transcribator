@@ -22,7 +22,7 @@ WEBVTT
 
 from typing import List
 from pathlib import Path
-from ..merger import MergedSegment
+from ..whisperx_pipeline import MergedSegment
 
 
 def format_srt_timestamp(seconds: float) -> str:

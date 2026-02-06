@@ -111,31 +111,44 @@ source venv/bin/activate
 **Как понять что окружение активировано?**
 В начале строки терминала появится `(venv)`.
 
-## Шаг 5: Установка зависимостей
+## Шаг 5: Установка зависимостей (WhisperX)
 
-**⚠️ КРИТИЧЕСКИ ВАЖНО: Устанавливайте в указанном порядке!**
+**1) Установите PyTorch с CUDA поддержкой**
+
+**Вариант А:** Через официальный селектор
+- Перейдите на https://pytorch.org/get-started/locally/
+- Выберите: OS: Windows, Package: pip, Compute Platform: CUDA
+- Скопируйте команду установки с сайта и выполните ее в активированном venv
+
+**Вариант Б:** Прямая установка (пример для CUDA 13.0)
+```bash
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu130
+```
+
+**Примечание:** Замените `cu130` на вашу версию CUDA:
+- `cu130` для CUDA 13.0
+- `cu121` для CUDA 12.1
+- `cu118` для CUDA 11.8
+
+**2) Установите WhisperX и утилиты проекта**
 
 ```bash
 # Обновляем pip
 pip install --upgrade pip
 
-# Устанавливаем в правильном порядке (избегаем конфликтов)
-pip install torch==2.10.0 torchaudio==2.10.0
-pip install pyannote.audio==4.0.3
-pip install faster-whisper==1.2.1
-pip install onnxruntime
-pip install pydub ffmpeg-python python-dotenv
+# Устанавливаем WhisperX и зависимости проекта
+pip install -r requirements.txt
 ```
 
 **Проверка установки:**
 ```bash
-pip list | findstr "whisper pyannote torch"
+pip list | findstr "whisperx torch torchaudio"
 ```
 
 Должны быть установлены:
-- faster-whisper 1.2.1
-- pyannote.audio 4.0.3
-- torch 2.10.0
+- whisperx
+- torch
+- torchaudio
 
 ## Шаг 6: Получение HuggingFace токена
 
@@ -235,13 +248,13 @@ python -m pip install --upgrade pip
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
 
-### Ошибка при установке pyannote.audio
+### Ошибка при установке WhisperX / GPU на Windows
 
 **Решение:**
-```bash
-# Установите Visual C++ Build Tools для Windows
-# Скачать с: https://visualstudio.microsoft.com/visual-cpp-build-tools/
-```
+1. Убедитесь, что PyTorch установлен с CUDA (не CPU версия)
+2. Убедитесь, что torchaudio также установлен с CUDA поддержкой
+3. Для RTX 50xx может потребоваться более новая версия PyTorch
+4. Проект настроен только на работу с CUDA GPU - CPU не поддерживается
 
 ### Медленная установка зависимостей
 

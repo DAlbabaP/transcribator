@@ -14,12 +14,11 @@ from dotenv import load_dotenv
 
 # Импорт модулей транскрибатора
 from src.audio_processor import AudioProcessor
-from src.transcriber import WhisperTranscriber
-from src.diarizer import SpeakerDiarizer
-from src.merger import TranscriptionMerger
+from src.whisperx_pipeline import run_whisperx_pipeline
 from src.exporters.text_exporter import export_to_text
 from src.exporters.json_exporter import export_to_json
 from src.exporters.srt_exporter import export_to_srt, export_to_vtt
+from src.command_store import save_command, list_commands, load_settings, save_settings
 
 
 class TranscribatorInterface:
@@ -29,17 +28,18 @@ class TranscribatorInterface:
         """Инициализация интерфейса"""
         load_dotenv()
         
+        default_device = self._detect_default_device()
+        default_compute = "float16"  # Только для CUDA GPU
+
         # Глобальные настройки (не меняются от файла к файлу)
         self.global_settings = {
             'output_dir': './output',
-            'device': 'cpu',
-            'compute_type': 'int8',
+            'device': default_device,
+            'compute_type': default_compute,
             'hf_token': os.getenv('HF_TOKEN'),
-            'min_overlap': 0.5,
-            'vad_filter': True,
-            'show_confidence': False,
-            'cpu_threads': 0,
-            'num_workers': 0
+            'batch_size': 16,
+            'align': True,
+            'show_confidence': False
         }
         
         # Настройки по умолчанию для файлов (могут быть переопределены при запуске)
@@ -55,12 +55,76 @@ class TranscribatorInterface:
         
         # Текущий выбранный файл
         self.selected_file = None
+        self.last_input_file = None
         
         self.models = ['tiny', 'base', 'small', 'medium', 'large-v2', 'large-v3']
         self.languages = ['ru', 'en', 'uk', 'be', 'kk']
-        self.devices = ['cpu', 'cuda']
-        self.compute_types = ['int8', 'float16', 'float32']
+        self.devices = ['cuda']  # Только CUDA GPU
+        self.compute_types = ['float16', 'float32']  # Только для CUDA GPU
         self.export_formats = ['text', 'json', 'srt', 'vtt', 'all']
+
+        self._load_saved_settings()
+        self._coerce_device_compute()
+
+    def _detect_default_device(self) -> str:
+        """Проверка доступности CUDA. Проект работает только на GPU."""
+        try:
+            import torch  # type: ignore
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA недоступна. Проект настроен только на работу с CUDA GPU.\n"
+                    "Убедитесь, что:\n"
+                    "1. Установлен PyTorch с поддержкой CUDA\n"
+                    "2. Установлены драйверы NVIDIA\n"
+                    "3. GPU поддерживает CUDA"
+                )
+            return "cuda"
+        except ImportError:
+            raise ImportError(
+                "PyTorch не установлен. Установите PyTorch с поддержкой CUDA.\n"
+                "См. инструкции в INSTALL.md"
+            )
+
+    def _coerce_device_compute(self):
+        """Принудительно используем CUDA и float16"""
+        if self.global_settings['device'] != 'cuda':
+            raise ValueError(f"Проект настроен только на CUDA GPU. Получено устройство: {self.global_settings['device']}")
+        if self.global_settings['compute_type'] == 'int8':
+            self.global_settings['compute_type'] = 'float16'
+
+    def _load_saved_settings(self):
+        saved = load_settings()
+        if not isinstance(saved, dict):
+            return
+        global_saved = saved.get("global")
+        if isinstance(global_saved, dict):
+            self.global_settings.update(global_saved)
+        defaults_saved = saved.get("defaults")
+        if isinstance(defaults_saved, dict):
+            self.default_file_settings.update(defaults_saved)
+        last_input = saved.get("last_input_file")
+        if isinstance(last_input, str) and last_input:
+            self.last_input_file = last_input
+
+        # Принудительно используем CUDA
+        if self.global_settings.get('device') not in self.devices:
+            self.global_settings['device'] = self._detect_default_device()
+        if self.global_settings.get('device') != 'cuda':
+            raise ValueError(f"Проект настроен только на CUDA GPU. Получено устройство: {self.global_settings.get('device')}")
+        if self.global_settings.get('compute_type') not in self.compute_types:
+            self.global_settings['compute_type'] = "float16"  # Только для CUDA GPU
+        if self.default_file_settings.get('model') not in self.models:
+            self.default_file_settings['model'] = os.getenv('WHISPER_MODEL', 'small')
+        if not isinstance(self.default_file_settings.get('formats'), list):
+            self.default_file_settings['formats'] = ['all']
+
+    def _save_settings(self):
+        payload = {
+            "global": self.global_settings,
+            "defaults": self.default_file_settings,
+            "last_input_file": self.last_input_file,
+        }
+        save_settings(payload)
     
     def clear_screen(self):
         """Очистка экрана"""
@@ -120,6 +184,142 @@ class TranscribatorInterface:
             except KeyboardInterrupt:
                 print("\n\nОперация отменена")
                 return ""
+
+    def _parse_yes_no(self, value: str, default: bool) -> bool:
+        if not value:
+            return default
+        return value.strip().lower() in {"y", "yes", "да", "д"}
+
+    def _parse_formats(self, raw: str) -> List[str]:
+        raw = raw.strip().lower()
+        if not raw:
+            return self.default_file_settings['formats'].copy()
+        if raw == "all":
+            return ["all"]
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        selected = [p for p in parts if p in self.export_formats and p != "all"]
+        return selected if selected else ["all"]
+
+    def run_linear(self):
+        """Линейный запуск без меню"""
+        self.clear_screen()
+        self.print_header("TRANSCRIBATOR")
+        print("Нажимайте Enter для значений по умолчанию.")
+        print()
+
+        file_path = self.get_input("Путь к файлу", self.last_input_file)
+        if not file_path:
+            return
+        if not os.path.exists(file_path):
+            print(f"❌ Файл не найден: {file_path}")
+            input("\nНажмите Enter для продолжения...")
+            return
+        self.selected_file = file_path
+        self.last_input_file = file_path
+
+        output_dir = self.get_input("Выходная папка", self.global_settings['output_dir'])
+
+        # Устройство всегда CUDA
+        device = "cuda"
+        print(f"Устройство: CUDA (GPU)")
+
+        default_compute = self.global_settings['compute_type']
+        if default_compute == "int8":
+            default_compute = "float16"
+
+        def compute_validator(v: str) -> bool:
+            if v in self.compute_types:
+                return True
+            print(f"❌ Допустимо: {', '.join(self.compute_types)}")
+            return False
+
+        compute_type = self.get_input(f"Тип вычислений ({'/'.join(self.compute_types)})", default_compute, validator=compute_validator)
+
+        def batch_validator(v: str) -> bool:
+            try:
+                return int(v) > 0
+            except ValueError:
+                print("❌ Введите целое число > 0")
+                return False
+
+        batch_size = int(self.get_input("Batch size", str(self.global_settings['batch_size']), validator=batch_validator))
+
+        align_raw = self.get_input(
+            "Alignment (y/n)",
+            "y" if self.global_settings['align'] else "n",
+        )
+        show_conf_raw = self.get_input(
+            "Показывать уверенность (y/n)",
+            "y" if self.global_settings['show_confidence'] else "n",
+        )
+
+        def model_validator(v: str) -> bool:
+            if v in self.models:
+                return True
+            print(f"❌ Допустимо: {', '.join(self.models)}")
+            return False
+
+        model = self.get_input("Модель", self.default_file_settings['model'], validator=model_validator)
+        language = self.get_input("Язык (код)", self.default_file_settings['language'])
+
+        formats_raw = self.get_input(
+            "Форматы (text,json,srt,vtt,all)",
+            ",".join(self.default_file_settings['formats']) if self.default_file_settings['formats'] else "all"
+        )
+        formats = self._parse_formats(formats_raw)
+
+        diarization_raw = self.get_input(
+            "Определение спикеров (y/n)",
+            "y" if not self.default_file_settings['no_diarization'] else "n",
+        )
+        no_diarization = not self._parse_yes_no(diarization_raw, default=not self.default_file_settings['no_diarization'])
+
+        num_speakers_raw = input("Количество спикеров (опционально): ").strip()
+        min_speakers_raw = input("Минимум спикеров (опционально): ").strip()
+        max_speakers_raw = input("Максимум спикеров (опционально): ").strip()
+
+        num_speakers = int(num_speakers_raw) if num_speakers_raw.isdigit() else None
+        min_speakers = int(min_speakers_raw) if min_speakers_raw.isdigit() else None
+        max_speakers = int(max_speakers_raw) if max_speakers_raw.isdigit() else None
+        if num_speakers is not None:
+            min_speakers = None
+            max_speakers = None
+
+        hf_token = input("HF токен (Enter = оставить текущий): ").strip()
+        if not hf_token:
+            hf_token = self.global_settings['hf_token']
+
+        self.global_settings.update({
+            "output_dir": output_dir,
+            "device": device,
+            "compute_type": compute_type,
+            "batch_size": batch_size,
+            "align": self._parse_yes_no(align_raw, self.global_settings['align']),
+            "show_confidence": self._parse_yes_no(show_conf_raw, self.global_settings['show_confidence']),
+            "hf_token": hf_token,
+        })
+        self._coerce_device_compute()
+
+        self.default_file_settings.update({
+            "model": model,
+            "language": language,
+            "formats": formats,
+            "no_diarization": no_diarization,
+        })
+
+        self._save_settings()
+
+        file_settings = {
+            "model": model,
+            "language": language,
+            "formats": formats,
+            "no_diarization": no_diarization,
+            "num_speakers": num_speakers,
+            "min_speakers": min_speakers,
+            "max_speakers": max_speakers,
+        }
+
+        self._run_with_settings(file_settings)
     
     def select_file(self) -> Optional[str]:
         """Выбор файла для обработки"""
@@ -182,8 +382,8 @@ class TranscribatorInterface:
             print(f"  Устройство: {self.global_settings['device']}")
             print(f"  Тип вычислений: {self.global_settings['compute_type']}")
             print(f"  HuggingFace токен: {'установлен' if self.global_settings['hf_token'] else 'не установлен'}")
-            print(f"  Минимальное пересечение: {self.global_settings['min_overlap']}")
-            print(f"  VAD фильтр: {'включен' if self.global_settings['vad_filter'] else 'выключен'}")
+            print(f"  Batch size: {self.global_settings['batch_size']}")
+            print(f"  Alignment: {'включено' if self.global_settings['align'] else 'выключено'}")
             print(f"  Показывать уверенность: {'да' if self.global_settings['show_confidence'] else 'нет'}")
             print()
             print("Настройки по умолчанию для файлов:")
@@ -195,11 +395,11 @@ class TranscribatorInterface:
             
             menu_items = [
                 ('1', 'Изменить выходную папку'),
-                ('2', 'Изменить устройство (CPU/CUDA)'),
+                ('2', 'Информация об устройстве (CUDA)'),
                 ('3', 'Изменить тип вычислений'),
                 ('4', 'Настроить HuggingFace токен'),
-                ('5', 'Изменить минимальное пересечение'),
-                ('6', 'Включить/выключить VAD фильтр'),
+                ('5', 'Изменить batch size'),
+                ('6', 'Включить/выключить alignment'),
                 ('7', 'Показывать уверенность'),
                 ('8', 'Изменить настройки по умолчанию для файлов'),
             ]
@@ -218,9 +418,9 @@ class TranscribatorInterface:
             elif choice == 4:
                 self._configure_hf_token()
             elif choice == 5:
-                self._configure_min_overlap()
+                self._configure_batch_size()
             elif choice == 6:
-                self._toggle_vad_filter()
+                self._toggle_alignment()
             elif choice == 7:
                 self._toggle_show_confidence()
             elif choice == 8:
@@ -238,24 +438,30 @@ class TranscribatorInterface:
             input("\nНажмите Enter для продолжения...")
     
     def _configure_device(self):
-        """Настройка устройства"""
+        """Настройка устройства (только CUDA)"""
         self.clear_screen()
         self.print_header("УСТРОЙСТВО")
-        print("Доступные устройства:")
-        for i, device in enumerate(self.devices, 1):
-            marker = " ← текущее" if device == self.global_settings['device'] else ""
-            name = "CPU" if device == 'cpu' else "CUDA (GPU)"
-            print(f"  {i}. {name} ({device}){marker}")
+        print("Проект настроен только на работу с CUDA GPU.")
+        print(f"Текущее устройство: CUDA (GPU)")
         print()
         
-        choice = self.get_choice(len(self.devices))
-        if choice > 0:
-            self.global_settings['device'] = self.devices[choice - 1]
-            # Автоматически меняем compute_type для GPU
-            if self.global_settings['device'] == 'cuda' and self.global_settings['compute_type'] == 'int8':
-                self.global_settings['compute_type'] = 'float16'
-            print(f"✓ Устройство установлено: {self.global_settings['device']}")
-            input("\nНажмите Enter для продолжения...")
+        # Проверяем доступность CUDA
+        try:
+            import torch
+            if torch.cuda.is_available():
+                print(f"✓ CUDA доступна")
+                print(f"  └─ GPU: {torch.cuda.get_device_name(0)}")
+                print(f"  └─ CUDA версия: {torch.version.cuda}")
+            else:
+                print("❌ CUDA недоступна!")
+                print("Убедитесь, что установлен PyTorch с поддержкой CUDA и драйверы NVIDIA.")
+        except ImportError:
+            print("❌ PyTorch не установлен!")
+            print("Установите PyTorch с поддержкой CUDA.")
+        except Exception as e:
+            print(f"❌ Ошибка при проверке CUDA: {e}")
+        
+        input("\nНажмите Enter для продолжения...")
     
     def _configure_compute_type(self):
         """Настройка типа вычислений"""
@@ -265,8 +471,7 @@ class TranscribatorInterface:
         for i, ct in enumerate(self.compute_types, 1):
             marker = " ← текущий" if ct == self.global_settings['compute_type'] else ""
             desc = {
-                'int8': 'Оптимально для CPU',
-                'float16': 'Оптимально для GPU',
+                'float16': 'Оптимально для GPU (рекомендуется)',
                 'float32': 'Максимальная точность (медленнее)'
             }.get(ct, '')
             print(f"  {i}. {ct} - {desc}{marker}")
@@ -301,50 +506,276 @@ class TranscribatorInterface:
         
         input("\nНажмите Enter для продолжения...")
     
-    def _configure_min_overlap(self):
-        """Настройка минимального пересечения"""
+    def _configure_batch_size(self):
+        """Настройка batch size"""
         self.clear_screen()
-        self.print_header("МИНИМАЛЬНОЕ ПЕРЕСЕЧЕНИЕ")
-        print(f"Текущее значение: {self.global_settings['min_overlap']}")
-        print("Рекомендуемое значение: 0.5 (50% пересечения)")
+        self.print_header("BATCH SIZE")
+        print(f"Текущее значение: {self.global_settings['batch_size']}")
+        print("Рекомендация: 8-24 для CUDA GPU (зависит от доступной VRAM)")
         print()
-        
-        new_value = input(f"Введите новое значение (0.0-1.0) [{self.global_settings['min_overlap']}]: ").strip()
+
+        new_value = input(f"Введите новое значение [{self.global_settings['batch_size']}]: ").strip()
         if new_value:
             try:
-                value = float(new_value)
-                if 0.0 <= value <= 1.0:
-                    self.global_settings['min_overlap'] = value
-                    print(f"✓ Минимальное пересечение установлено: {value}")
+                value = int(new_value)
+                if value > 0:
+                    self.global_settings['batch_size'] = value
+                    print(f"✓ Batch size установлен: {value}")
                 else:
-                    print("❌ Значение должно быть от 0.0 до 1.0")
-            except:
+                    print("❌ Значение должно быть > 0")
+            except ValueError:
                 print("❌ Неверное значение")
         else:
             print("Значение не изменено")
-        
+
         input("\nНажмите Enter для продолжения...")
-    
-    def _toggle_vad_filter(self):
-        """Переключение VAD фильтра"""
+
+    def _toggle_alignment(self):
+        """Переключение alignment"""
         self.clear_screen()
-        self.print_header("VAD ФИЛЬТР")
-        current = "включен" if self.global_settings['vad_filter'] else "выключен"
+        self.print_header("ALIGNMENT")
+        current = "включено" if self.global_settings['align'] else "выключено"
         print(f"Текущее состояние: {current}")
         print()
-        print("1. Включить VAD фильтр")
-        print("2. Выключить VAD фильтр")
+        print("1. Включить alignment (word-level timestamps)")
+        print("2. Выключить alignment")
         print()
-        
+
         choice = self.get_choice(2)
         if choice == 1:
-            self.global_settings['vad_filter'] = True
-            print("✓ VAD фильтр включен")
+            self.global_settings['align'] = True
+            print("✓ Alignment включен")
         elif choice == 2:
-            self.global_settings['vad_filter'] = False
-            print("✓ VAD фильтр выключен")
-        
+            self.global_settings['align'] = False
+            print("✓ Alignment выключен")
+
         input("\nНажмите Enter для продолжения...")
+
+    def _build_cli_command(self, settings: Dict) -> str:
+        def quote(value: str) -> str:
+            if " " in value or "(" in value or ")" in value:
+                return f"\"{value}\""
+            return value
+
+        cmd = ["python", "main.py", quote(settings['input_file'])]
+        cmd += ["--output-dir", quote(settings['output_dir'])]
+        cmd += ["--model", settings['model']]
+        cmd += ["--language", settings['language']]
+        cmd += ["--device", settings['device']]
+        cmd += ["--compute-type", settings['compute_type']]
+        cmd += ["--batch-size", str(settings['batch_size'])]
+        cmd += ["--no-align"] if not settings['align'] else ["--align"]
+
+        if settings['no_diarization']:
+            cmd.append("--no-diarization")
+        else:
+            if settings.get('num_speakers'):
+                cmd += ["--num-speakers", str(settings['num_speakers'])]
+            else:
+                if settings.get('min_speakers') is not None:
+                    cmd += ["--min-speakers", str(settings['min_speakers'])]
+                if settings.get('max_speakers') is not None:
+                    cmd += ["--max-speakers", str(settings['max_speakers'])]
+            if settings.get('hf_token') and settings['hf_token'] != 'your_huggingface_token_here':
+                cmd += ["--hf-token", settings['hf_token']]
+
+        if 'all' in settings['formats']:
+            cmd += ["--formats", "all"]
+        else:
+            cmd += ["--formats"] + settings['formats']
+
+        if settings.get('show_confidence'):
+            cmd.append("--show-confidence")
+
+        return " ".join(cmd)
+
+    def _save_cli_command_prompt(self, settings: Dict):
+        """Сохранить команду CLI"""
+        print()
+        choice = input("Сохранить команду для CLI? (y/n) [n]: ").strip().lower()
+        if choice != 'y':
+            return
+        name = input("Имя команды (например: meeting_fast): ").strip()
+        if not name:
+            print("❌ Имя не указано, команда не сохранена.")
+            return
+        command_str = self._build_cli_command(settings)
+        try:
+            save_command(name, command_str)
+            print(f"✓ Команда сохранена: {name}")
+        except Exception as e:
+            print(f"❌ Не удалось сохранить: {e}")
+
+    def _print_saved_commands(self):
+        """Показать сохраненные команды"""
+        self.clear_screen()
+        self.print_header("СОХРАНЕННЫЕ КОМАНДЫ")
+        commands = list_commands()
+        if not commands:
+            print("Сохраненных команд нет.")
+        else:
+            for item in commands:
+                desc = f" - {item['description']}" if item.get("description") else ""
+                print(f"• {item['name']}{desc}")
+                print(f"  {item['command']}")
+                print()
+        input("Нажмите Enter для продолжения...")
+
+    def _quick_preset_settings(self) -> Optional[Dict]:
+        """Быстрый выбор пресета"""
+        self.clear_screen()
+        self.print_header("БЫСТРЫЙ СТАРТ")
+        print("Выберите пресет качества:")
+        print("1. Быстро (small, alignment off, batch 8)")
+        print("2. Сбалансировано (small, alignment on, batch 16)")
+        print("3. Точно (medium, alignment on, batch 16)")
+        print()
+        choice = self.get_choice(3)
+        if choice == 0:
+            return None
+
+        file_settings = {
+            'model': self.default_file_settings['model'],
+            'language': self.default_file_settings['language'],
+            'formats': self.default_file_settings['formats'].copy(),
+            'no_diarization': self.default_file_settings['no_diarization'],
+            'num_speakers': None,
+            'min_speakers': None,
+            'max_speakers': None
+        }
+
+        if choice == 1:
+            file_settings['model'] = 'small'
+            self.global_settings['batch_size'] = 8
+            self.global_settings['align'] = False
+        elif choice == 2:
+            file_settings['model'] = 'small'
+            self.global_settings['batch_size'] = 16
+            self.global_settings['align'] = True
+        elif choice == 3:
+            file_settings['model'] = 'medium'
+            self.global_settings['batch_size'] = 16
+            self.global_settings['align'] = True
+
+        print()
+        print("Определение спикеров:")
+        print("1. Включить")
+        print("2. Выключить")
+        sp = self.get_choice(2)
+        if sp == 2:
+            file_settings['no_diarization'] = True
+        elif sp == 1:
+            file_settings['no_diarization'] = False
+            print("Количество спикеров (опционально)")
+            print("1. Указать точное")
+            print("2. Указать диапазон")
+            print("3. Не указывать")
+            sp_choice = self.get_choice(3)
+            if sp_choice == 1:
+                num = input("Сколько спикеров: ").strip()
+                try:
+                    file_settings['num_speakers'] = int(num)
+                except ValueError:
+                    pass
+            elif sp_choice == 2:
+                min_sp = input("Минимум: ").strip()
+                max_sp = input("Максимум: ").strip()
+                try:
+                    file_settings['min_speakers'] = int(min_sp) if min_sp else None
+                    file_settings['max_speakers'] = int(max_sp) if max_sp else None
+                except ValueError:
+                    pass
+
+        return file_settings
+
+    def _simple_wizard_settings(self) -> Optional[Dict]:
+        """Пошаговый мастер настроек"""
+        self.clear_screen()
+        self.print_header("МАСТЕР НАСТРОЕК")
+        print("Ответьте на 4 простых вопроса.")
+        print()
+
+        file_settings = {
+            'model': self.default_file_settings['model'],
+            'language': self.default_file_settings['language'],
+            'formats': self.default_file_settings['formats'].copy(),
+            'no_diarization': self.default_file_settings['no_diarization'],
+            'num_speakers': None,
+            'min_speakers': None,
+            'max_speakers': None
+        }
+
+        print("1) Качество распознавания:")
+        print("1. Быстро (small)")
+        print("2. Сбалансировано (small)")
+        print("3. Максимально точно (medium)")
+        quality = self.get_choice(3)
+        if quality == 1:
+            file_settings['model'] = 'small'
+            self.global_settings['batch_size'] = 8
+            self.global_settings['align'] = False
+        elif quality == 2:
+            file_settings['model'] = 'small'
+            self.global_settings['batch_size'] = 16
+            self.global_settings['align'] = True
+        elif quality == 3:
+            file_settings['model'] = 'medium'
+            self.global_settings['batch_size'] = 16
+            self.global_settings['align'] = True
+
+        print()
+        lang = input("2) Язык (например ru, en) [ru]: ").strip().lower()
+        if lang:
+            file_settings['language'] = lang
+
+        print()
+        print("3) Нужны ли спикеры?")
+        print("1. Да")
+        print("2. Нет")
+        sp = self.get_choice(2)
+        if sp == 2:
+            file_settings['no_diarization'] = True
+        else:
+            file_settings['no_diarization'] = False
+
+        print()
+        fmt = input("4) Форматы (txt/json/srt/vtt/all) [all]: ").strip().lower()
+        if fmt:
+            if fmt == "all":
+                file_settings['formats'] = ['all']
+            else:
+                parts = [p.strip() for p in fmt.split(",") if p.strip()]
+                if parts:
+                    file_settings['formats'] = parts
+
+        return file_settings
+
+    def _quick_start_menu(self):
+        """Меню быстрого старта"""
+        if not self.selected_file:
+            self.select_file()
+            if not self.selected_file:
+                return
+
+        self.clear_screen()
+        self.print_header("БЫСТРЫЙ СТАРТ")
+        print("Выберите способ настройки:")
+        print("1. Пресеты (быстро/сбалансировано/точно)")
+        print("2. Мастер (4 вопроса)")
+        print()
+        choice = self.get_choice(2)
+        if choice == 0:
+            return
+
+        if choice == 1:
+            file_settings = self._quick_preset_settings()
+        else:
+            file_settings = self._simple_wizard_settings()
+
+        if not file_settings:
+            return
+
+        self._run_with_settings(file_settings)
     
     def _toggle_show_confidence(self):
         """Переключение показа уверенности"""
@@ -366,7 +797,7 @@ class TranscribatorInterface:
             print("✓ Показ уверенности выключен")
         
         input("\nНажмите Enter для продолжения...")
-    
+
     def _configure_default_file_settings(self):
         """Настройка значений по умолчанию для файлов"""
         while True:
@@ -475,7 +906,7 @@ class TranscribatorInterface:
             else:
                 print("❌ Не выбрано ни одного формата, установлен 'all'")
                 self.default_file_settings['formats'] = ['all']
-        except:
+        except ValueError:
             print("❌ Ошибка ввода, форматы не изменены")
         
         input("\nНажмите Enter для продолжения...")
@@ -511,6 +942,9 @@ class TranscribatorInterface:
         print(f"  Устройство: {self.global_settings['device']}")
         print(f"  Тип вычислений: {self.global_settings['compute_type']}")
         print(f"  HuggingFace токен: {'установлен' if self.global_settings['hf_token'] else 'не установлен'}")
+        print(f"  Batch size: {self.global_settings['batch_size']}")
+        print(f"  Alignment: {'включено' if self.global_settings['align'] else 'выключено'}")
+        print(f"  Показывать уверенность: {'да' if self.global_settings['show_confidence'] else 'нет'}")
         print()
         print("Настройки по умолчанию для файлов:")
         print(f"  Модель: {self.default_file_settings['model']}")
@@ -562,7 +996,7 @@ class TranscribatorInterface:
                 idx = int(choice) - 1
                 if 0 <= idx < len(self.models):
                     file_settings['model'] = self.models[idx]
-            except:
+            except ValueError:
                 pass
         
         # Язык
@@ -582,7 +1016,7 @@ class TranscribatorInterface:
                 idx = int(choice) - 1
                 if 0 <= idx < len(self.languages):
                     file_settings['language'] = self.languages[idx]
-            except:
+            except ValueError:
                 # Возможно, это код языка
                 if len(choice) == 2:
                     file_settings['language'] = choice.lower()
@@ -613,7 +1047,7 @@ class TranscribatorInterface:
                     file_settings['formats'] = [self.export_formats[i-1] for i in selected if 1 <= i <= len(self.export_formats)]
                     if not file_settings['formats']:
                         file_settings['formats'] = ['all']
-            except:
+            except ValueError:
                 pass
         print()
         
@@ -644,7 +1078,7 @@ class TranscribatorInterface:
                     file_settings['num_speakers'] = int(num)
                     file_settings['min_speakers'] = None
                     file_settings['max_speakers'] = None
-                except:
+                except ValueError:
                     pass
             elif choice == 'b':
                 min_sp = input("Минимум: ").strip()
@@ -653,7 +1087,7 @@ class TranscribatorInterface:
                     file_settings['min_speakers'] = int(min_sp) if min_sp else None
                     file_settings['max_speakers'] = int(max_sp) if max_sp else None
                     file_settings['num_speakers'] = None
-                except:
+                except ValueError:
                     pass
         
         # Показываем итоговые настройки
@@ -679,8 +1113,8 @@ class TranscribatorInterface:
         
         return file_settings
     
-    def run_transcription(self):
-        """Запуск транскрибации"""
+    def _run_with_settings(self, file_settings: Dict):
+        """Запуск транскрибации с готовыми настройками"""
         if not self.selected_file:
             self.clear_screen()
             self.print_header("ОШИБКА")
@@ -688,21 +1122,22 @@ class TranscribatorInterface:
             print("Сначала выберите файл для обработки.")
             input("\nНажмите Enter для продолжения...")
             return
-        
+
         if not os.path.exists(self.selected_file):
             self.clear_screen()
             self.print_header("ОШИБКА")
             print(f"❌ Файл не найден: {self.selected_file}")
             input("\nНажмите Enter для продолжения...")
             return
-        
-        # Запрашиваем параметры для этого файла
-        file_settings = self.request_file_settings()
-        if not file_settings:
-            return  # Пользователь отменил
-        
+
         # Объединяем глобальные и файловые настройки
         settings = {**self.global_settings, **file_settings, 'input_file': self.selected_file}
+
+        # Принудительно используем CUDA и float16
+        if settings['device'] != 'cuda':
+            raise ValueError(f"Проект настроен только на CUDA GPU. Получено устройство: {settings['device']}")
+        if settings['compute_type'] == 'int8':
+            settings['compute_type'] = 'float16'
         
         # Создаем директорию для результатов
         output_dir = Path(settings['output_dir'])
@@ -725,7 +1160,7 @@ class TranscribatorInterface:
         
         try:
             # Шаг 1: Предобработка аудио
-            print("[1/5] ПРЕДОБРАБОТКА АУДИО")
+            print("[1/3] ПРЕДОБРАБОТКА АУДИО")
             print("-" * 80)
             processor = AudioProcessor()
             processed_audio = processor.preprocess_audio(settings['input_file'])
@@ -733,98 +1168,38 @@ class TranscribatorInterface:
             print(f"✓ Предобработка завершена! Длительность: {audio_duration:.2f} сек ({audio_duration/60:.1f} мин)")
             print()
             
-            # Шаг 2: Транскрибация
-            print("[2/5] ТРАНСКРИБАЦИЯ")
+            # Шаг 2: WhisperX
+            print("[2/3] WHISPERX")
             print("-" * 80)
-            
-            cpu_count = os.cpu_count() or 4
-            cpu_threads = settings['cpu_threads'] if settings['cpu_threads'] > 0 else cpu_count
-            num_workers = settings['num_workers'] if settings['num_workers'] > 0 else min(4, cpu_count)
-            
-            transcriber = WhisperTranscriber(
+            merged_segments, wx_metadata = run_whisperx_pipeline(
+                audio_file=processed_audio,
                 model_size=settings['model'],
                 device=settings['device'],
                 compute_type=settings['compute_type'],
-                cpu_threads=cpu_threads,
-                num_workers=num_workers
-            )
-            transcription_segments = transcriber.transcribe(
-                processed_audio,
+                batch_size=settings['batch_size'],
                 language=settings['language'],
-                vad_filter=settings['vad_filter']
+                align=settings['align'],
+                diarize=not settings['no_diarization'],
+                hf_token=settings['hf_token'],
+                num_speakers=settings['num_speakers'],
+                min_speakers=settings['min_speakers'],
+                max_speakers=settings['max_speakers']
             )
-            print(f"✓ Транскрибация завершена! Сегментов: {len(transcription_segments)}")
+            print(f"✓ WhisperX завершен! Сегментов: {len(merged_segments)}")
             print()
-            
-            # Шаг 3: Определение спикеров
-            diarization_segments = None
-            if not settings['no_diarization']:
-                print("[3/5] ОПРЕДЕЛЕНИЕ СПИКЕРОВ")
-                print("-" * 80)
-                
-                hf_token = settings['hf_token']
-                if not hf_token or hf_token == 'your_huggingface_token_here':
-                    print("❌ Ошибка: не указан HuggingFace токен!")
-                    print("Укажите токен в настройках.")
-                    input("\nНажмите Enter для продолжения...")
-                    return
-                
-                diarizer_device = settings['device']
-                if settings['device'] == 'cuda':
-                    import torch
-                    if torch.cuda.is_available():
-                        device_capability = torch.cuda.get_device_capability(0)
-                        if device_capability[0] >= 12:
-                            print(f"⚠️  GPU архитектура не поддерживается, используем CPU")
-                            diarizer_device = 'cpu'
-                
-                diarizer = SpeakerDiarizer(hf_token=hf_token, device=diarizer_device)
-                diarization_segments = diarizer.diarize(
-                    processed_audio,
-                    num_speakers=settings['num_speakers'],
-                    min_speakers=settings['min_speakers'],
-                    max_speakers=settings['max_speakers']
-                )
-                print(f"✓ Определение спикеров завершено!")
-                print()
-            else:
-                print("[3/5] ОПРЕДЕЛЕНИЕ СПИКЕРОВ - ПРОПУЩЕНО")
-                print("-" * 80)
-                print()
-            
-            # Шаг 4: Объединение результатов
-            print("[4/5] ОБЪЕДИНЕНИЕ РЕЗУЛЬТАТОВ")
-            print("-" * 80)
-            if diarization_segments:
-                merger = TranscriptionMerger(min_overlap_ratio=settings['min_overlap'])
-                merged_segments = merger.merge(transcription_segments, diarization_segments)
-                stats = merger.get_statistics(merged_segments)
-                print(f"✓ Объединение завершено! Сегментов: {len(merged_segments)}, Спикеров: {stats['num_speakers']}")
-            else:
-                from src.merger import MergedSegment
-                merged_segments = [
-                    MergedSegment(
-                        start=seg.start,
-                        end=seg.end,
-                        text=seg.text,
-                        speaker='SPEAKER_00',
-                        confidence=1.0
-                    )
-                    for seg in transcription_segments
-                ]
-                print(f"✓ Сегментов транскрипции: {len(merged_segments)}")
-            print()
-            
-            # Шаг 5: Экспорт результатов
-            print("[5/5] ЭКСПОРТ РЕЗУЛЬТАТОВ")
+
+            # Шаг 3: Экспорт результатов
+            print("[3/3] ЭКСПОРТ РЕЗУЛЬТАТОВ")
             print("-" * 80)
             
             metadata = {
                 'source_file': os.path.basename(settings['input_file']),
-                'model': settings['model'],
-                'language': settings['language'],
+                'model': wx_metadata.get('model', settings['model']),
+                'language': wx_metadata.get('language', settings['language']),
                 'duration': audio_duration,
-                'diarization_enabled': not settings['no_diarization']
+                'diarization_enabled': not settings['no_diarization'],
+                'aligned': wx_metadata.get('aligned', settings['align']),
+                'batch_size': wx_metadata.get('batch_size', settings['batch_size'])
             }
             
             exported_files = []
@@ -875,8 +1250,8 @@ class TranscribatorInterface:
             if processed_audio != settings['input_file']:
                 try:
                     os.remove(processed_audio)
-                except:
-                    pass
+                except OSError as e:
+                    print(f"⚠️  Не удалось удалить временный файл: {processed_audio} ({e})")
             
             # Итоги
             elapsed_time = time.time() - start_time
@@ -892,6 +1267,7 @@ class TranscribatorInterface:
             for file_path in exported_files:
                 print(f"  - {file_path}")
             print("=" * 80)
+            self._save_cli_command_prompt(settings)
             
         except KeyboardInterrupt:
             print("\n\n❌ Операция прервана пользователем")
@@ -901,6 +1277,14 @@ class TranscribatorInterface:
             traceback.print_exc()
         
         input("\nНажмите Enter для продолжения...")
+
+    def run_transcription(self):
+        """Запуск транскрибации"""
+        # Запрашиваем параметры для этого файла
+        file_settings = self.request_file_settings()
+        if not file_settings:
+            return  # Пользователь отменил
+        self._run_with_settings(file_settings)
     
     def main_menu(self):
         """Главное меню"""
@@ -911,8 +1295,10 @@ class TranscribatorInterface:
             menu_items = [
                 ('1', 'Выбрать файл для обработки'),
                 ('2', 'Настроить параметры'),
-                ('3', 'Показать сводку настроек'),
-                ('4', 'Запустить транскрибацию'),
+                ('3', 'Быстрый старт (пресеты/мастер)'),
+                ('4', 'Показать сводку настроек'),
+                ('5', 'Запустить транскрибацию'),
+                ('6', 'Сохраненные команды'),
             ]
             
             self.print_menu(menu_items)
@@ -927,16 +1313,20 @@ class TranscribatorInterface:
             elif choice == 2:
                 self.configure_settings()
             elif choice == 3:
-                self.show_summary()
+                self._quick_start_menu()
             elif choice == 4:
+                self.show_summary()
+            elif choice == 5:
                 self.run_transcription()
+            elif choice == 6:
+                self._print_saved_commands()
 
 
 def main():
     """Главная функция"""
     try:
         interface = TranscribatorInterface()
-        interface.main_menu()
+        interface.run_linear()
     except KeyboardInterrupt:
         print("\n\nПрограмма завершена")
         sys.exit(0)

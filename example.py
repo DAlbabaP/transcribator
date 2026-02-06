@@ -5,9 +5,7 @@
 """
 
 from src.audio_processor import AudioProcessor
-from src.transcriber import WhisperTranscriber
-from src.diarizer import SpeakerDiarizer
-from src.merger import TranscriptionMerger
+from src.whisperx_pipeline import run_whisperx_pipeline
 from src.exporters.text_exporter import export_to_text
 from src.exporters.json_exporter import export_to_json
 from src.exporters.srt_exporter import export_to_srt
@@ -25,22 +23,21 @@ def transcribe_file_simple(audio_file: str, output_dir: str = "./output"):
     processor = AudioProcessor()
     processed_audio = processor.preprocess_audio(audio_file)
     
-    # 2. Транскрибация
-    transcriber = WhisperTranscriber(model_size='small', device='cpu')
-    segments = transcriber.transcribe(processed_audio, language='ru')
-    
-    # 3. Экспорт (без спикеров)
-    from src.merger import MergedSegment
-    merged_segments = [
-        MergedSegment(
-            start=seg.start,
-            end=seg.end,
-            text=seg.text,
-            speaker='SPEAKER_00',
-            confidence=1.0
-        )
-        for seg in segments
-    ]
+    # 2. WhisperX (без diarization)
+    merged_segments, _ = run_whisperx_pipeline(
+        audio_file=processed_audio,
+        model_size="small",
+        device="cuda",
+        compute_type="float16",
+        batch_size=16,
+        language="ru",
+        align=True,
+        diarize=False,
+        hf_token=None,
+        num_speakers=None,
+        min_speakers=None,
+        max_speakers=None
+    )
     
     # Сохраняем результаты
     os.makedirs(output_dir, exist_ok=True)
@@ -61,27 +58,26 @@ def transcribe_file_with_speakers(audio_file: str, hf_token: str, output_dir: st
     processor = AudioProcessor()
     processed_audio = processor.preprocess_audio(audio_file)
     
-    # 2. Транскрибация
-    print("\n[2/5] Транскрибация...")
-    transcriber = WhisperTranscriber(model_size='small', device='cpu')
-    transcription = transcriber.transcribe(processed_audio, language='ru')
-    print(f"✓ Получено {len(transcription)} сегментов")
+    # 2. WhisperX (с diarization)
+    print("\n[2/3] WhisperX...")
+    merged, _ = run_whisperx_pipeline(
+        audio_file=processed_audio,
+        model_size="small",
+        device="cuda",
+        compute_type="float16",
+        batch_size=16,
+        language="ru",
+        align=True,
+        diarize=True,
+        hf_token=hf_token,
+        num_speakers=None,
+        min_speakers=None,
+        max_speakers=None
+    )
+    print(f"✓ Объединено: {len(merged)} сегментов")
     
-    # 3. Определение спикеров
-    print("\n[3/5] Определение спикеров...")
-    diarizer = SpeakerDiarizer(hf_token=hf_token, device='cpu')
-    diarization = diarizer.diarize(processed_audio)
-    print(f"✓ Определено спикеров: {len(set(seg.speaker for seg in diarization))}")
-    
-    # 4. Объединение результатов
-    print("\n[4/5] Объединение результатов...")
-    merger = TranscriptionMerger(min_overlap_ratio=0.5)
-    merged = merger.merge(transcription, diarization)
-    stats = merger.get_statistics(merged)
-    print(f"✓ Объединено: {len(merged)} сегментов, {stats['num_speakers']} спикеров")
-    
-    # 5. Экспорт во все форматы
-    print("\n[5/5] Экспорт результатов...")
+    # 3. Экспорт во все форматы
+    print("\n[3/3] Экспорт результатов...")
     os.makedirs(output_dir, exist_ok=True)
     
     export_to_text(merged, f"{output_dir}/transcript.txt")

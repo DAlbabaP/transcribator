@@ -70,8 +70,8 @@ class AudioProcessor:
         if file_extension in self.SUPPORTED_VIDEO_FORMATS and audio_file != str(input_path):
             try:
                 os.remove(audio_file)
-            except:
-                pass
+            except OSError as e:
+                print(f"⚠️  Не удалось удалить временный файл: {audio_file} ({e})")
         return processed_file
     
     def _extract_audio_from_video(self, video_file: str) -> str:
